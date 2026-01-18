@@ -1,0 +1,220 @@
+  return (
+    Deno.env.get("PAYSTACK_SECRET_KEY") ||
+    Deno.env.get("PAYSTACK_SECRET") ||
+    Deno.env.get("PAYSTACK_WEBHOOK_SECRET") ||
+    ""
+  );
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+const RATE_LIMIT_CONFIG = {
+  maxRequests: 100,    // 100 requests (webhooks can burst)
+  windowMs: 60 * 1000, // per minute
+  keyPrefix: 'paystack_webhook',
+};
+
+// Paystack webhook IPs (for additional verification)
+// These may change - check Paystack docs for current list
+const PAYSTACK_IPS = [
+  '52.31.139.75',
+  '52.49.173.169',
+  '52.214.14.220',
+];
+
+// ============================================================================
+// Types
+// ============================================================================
+
+interface PaystackWebhookEvent {
+  event: string;
+  data: {
+    id: number;
+    domain: string;
+    status: string;
+    reference: string;
+    amount: number;
+    message?: string;
+    gateway_response?: string;
+    paid_at?: string;
+    created_at: string;
+    channel?: string;
+    currency: string;
+    ip_address?: string;
+    metadata?: {
+      job_id?: string;
+      customer_id?: string;
+      provider_id?: string;
+      payment_type?: string;
+      [key: string]: unknown;
+    };
+    fees?: number;
+    customer?: {
+      id: number;
+      email: string;
+      [key: string]: unknown;
+    };
+    authorization?: {
+      authorization_code?: string;
+      [key: string]: unknown;
+    };
+  };
+}
+
+// ============================================================================
+// Idempotency Store (in-memory, use Redis/KV in production)
+// ============================================================================
+
+const processedEvents = new Set<string>();
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Clean up old entries periodically
+setInterval(() => {
+  // In production, use proper TTL with Redis
+  if (processedEvents.size > 10000) {
+    processedEvents.clear();
+  }
+}, 60 * 60 * 1000); // Every hour
+
+// ============================================================================
+// Event Handlers
+// ============================================================================
+
+async function handleChargeSuccess(
+  data: PaystackWebhookEvent['data'],
+  supabaseAdmin: ReturnType<typeof createClient>,
+  requestId: string
+): Promise<void> {
+  const jobId = data.metadata?.job_id;
+  
+  if (!jobId) {
+    console.error(`[${requestId}] ❌ No job_id in metadata, skipping job update`);
+    console.error(`[${requestId}] Full metadata:`, JSON.stringify(data.metadata, null, 2));
+    console.error(`[${requestId}] This means the initiate-paystack function didn't include job_id in metadata, or Paystack didn't forward it.`);
+    return;
+  }
+  
+  console.log(`[${requestId}] ✅ Found job_id in metadata: ${jobId}`);
+
+  const amountPaid = data.amount / 100; // Convert from minor units
+  const paymentMethod = data.channel === 'mobile_money' ? 'mpesa' : 
+                        data.channel === 'card' ? 'card' : 'other';
+
+  console.log(`[${requestId}] Processing successful charge for job:`, {
+    jobId,
+    amount: amountPaid,
+    reference: data.reference,
+    channel: data.channel,
+  });
+
+  // ========================================================================
+  // UPDATE PAYMENT RECORD
+  // ========================================================================
+  
+  const { data: payment, error: paymentUpdateError } = await supabaseAdmin
+    .from("payments")
+    .update({
+      status: "completed",
+      processed_at: data.paid_at || new Date().toISOString(),
+    })
+    .eq("paystack_reference", data.reference)
+    .neq("status", "completed")
+    .select("id, job_id, customer_id, provider_id, amount, paystack_subaccount_id")
+    .maybeSingle();
+
+  if (paymentUpdateError) {
+    console.warn(`[${requestId}] Failed to update payment record:`, paymentUpdateError);
+  } else if (payment) {
+    console.log(`[${requestId}] Payment record updated: ${payment.id}`);
+  }
+
+  // ========================================================================
+  // UPDATE JOB PAYMENT STATUS
+  // ========================================================================
+  
+  const { data: updatedJob, error } = await supabaseAdmin
+    .from("jobs")
+    .update({
+      payment_status: "completed",
+      payment_completed_at: data.paid_at || new Date().toISOString(),
+      payment_amount: amountPaid,
+      payment_method: paymentMethod,
+      payment_reference: data.reference,
+      status: "completed",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", jobId)
+    .eq("payment_status", "pending") // Only update if still pending (idempotency)
+    .select("id, customer_id, provider_id, quote_total, platform_fee_percent")
+    .single();
+
+  if (error) {
+    // Could be already processed or job not found
+    console.warn(`[${requestId}] Failed to update job ${jobId}:`, error.message);
+    return;
+  }
+
+  if (!updatedJob) {
+    console.log(`[${requestId}] Job ${jobId} already processed or not found`);
+    return;
+  }
+
+    console.log(`[${requestId}] Job ${jobId} payment completed successfully`);
+    
+  // ========================================================================
+  // CREATE PAYOUT RECORD FOR PROVIDER
+  // ========================================================================
+  
+  const platformFeePercent = updatedJob.platform_fee_percent || 15;
+  const platformFee = amountPaid * (platformFeePercent / 100);
+  const netAmount = amountPaid - platformFee;
+
+  console.log(`[${requestId}] Creating payout: amount=${amountPaid}, fee=${platformFee}, net=${netAmount}`);
+
+  try {
+    // Get provider's default payout method
+    const { data: payoutMethod } = await supabaseAdmin
+      .from("provider_payout_methods")
+      .select("id, paystack_subaccount_id")
+      .eq("provider_id", updatedJob.provider_id)
+      .eq("is_default", true)
+      .maybeSingle();
+
+    const subaccountId = payment?.paystack_subaccount_id || payoutMethod?.paystack_subaccount_id;
+
+    // Create payout record
+    const { data: payout, error: payoutError } = await supabaseAdmin
+      .from("payouts")
+      .insert({
+        provider_id: updatedJob.provider_id,
+        job_id: jobId,
+        payment_id: payment?.id,
+        payout_method_id: payoutMethod?.id,
+        amount: amountPaid,
+        currency: data.currency || 'KES',
+        platform_fee: platformFee,
+        net_amount: netAmount,
+        status: subaccountId ? 'completed' : 'pending', // If routed to subaccount, mark as completed
+        paystack_subaccount_id: subaccountId,
+        initiated_at: new Date().toISOString(),
+        completed_at: subaccountId ? new Date().toISOString() : null,
+        metadata: {
+          job_id: jobId,
+          payment_reference: data.reference,
+          paystack_fees: data.fees,
+          routing_method: subaccountId ? 'subaccount' : 'manual',
+        },
+      })
+      .select()
+      .single();
+
+    if (payoutError) {
+      console.error(`[${requestId}] Failed to create payout:`, payoutError);
+    } else {
+      console.log(`[${requestId}] ✅ Payout created: ${payout.id} (status: ${payout.status})`);
+      
+      if (subaccountId) {
+        console.log(`[${requestId}] Funds routed to subaccount: ${subaccountId}`);
+      } else {

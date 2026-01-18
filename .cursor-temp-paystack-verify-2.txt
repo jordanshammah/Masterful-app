@@ -1,0 +1,39 @@
+    // ========================================================================
+    // 7. Return Verification Result (Enhanced)
+    // ========================================================================
+    
+    return successResponse(
+      {
+        status: paystackData.data.status,
+        reference: paystackData.data.reference,
+        amount: paystackData.data.amount / 100, // Return in major units
+        currency: paystackData.data.currency,
+        channel: paystackData.data.channel,
+        paid_at: paystackData.data.paid_at,
+        gateway_response: paystackData.data.gateway_response,
+        metadata: paystackData.data.metadata,
+        reconciliation: {
+          job_updated: jobUpdated,
+          payout_created: payoutCreated,
+        },
+        paystack: {
+          status: paystackData.status,
+          data: {
+            status: paystackData.data.status,
+          }
+        },
+      },
+      corsHeaders,
+      requestId
+    );
+
+  } catch (error) {
+    console.error(`[${requestId}] Unhandled error:`, error);
+    return errorResponse(
+      "An unexpected error occurred. Please try again.",
+      500,
+      corsHeaders,
+      requestId
+    );
+  }
+});

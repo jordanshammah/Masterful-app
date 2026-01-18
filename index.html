@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes" />
+    <meta name="theme-color" content="#0A0A0A" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="format-detection" content="telephone=no" />
+    
+    <!-- Content Security Policy -->
+    <!-- Note: CSP is relaxed for development. Tighten for production deployment. -->
+    <meta http-equiv="Content-Security-Policy" content="
+      default-src 'self' http://localhost:* http://127.0.0.1:* http://*.local:* ws://localhost:* ws://127.0.0.1:* ws://*.local:*;
+      script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:* http://127.0.0.1:* http://*.local:* https://js.paystack.co https://api.mapbox.com;
+      style-src 'self' 'unsafe-inline' http://localhost:* http://127.0.0.1:* http://*.local:* https://api.mapbox.com https://fonts.googleapis.com https://api.fontshare.com;
+      img-src 'self' data: https: http: blob:;
+      font-src 'self' data: https://fonts.gstatic.com;
+      connect-src 'self' http://localhost:* http://127.0.0.1:* http://*.local:* ws://localhost:* ws://127.0.0.1:* ws://*.local:* https://*.supabase.co wss://*.supabase.co https://api.paystack.co https://api.mapbox.com https://events.mapbox.com;
+      frame-src 'self' https://js.paystack.co;
+      worker-src 'self' blob:;
+      object-src 'none';
+      base-uri 'self';
+      form-action 'self';
+      frame-ancestors 'none';
+    " />
+    <title>Masterful - Connect with Expert Local Tradespeople</title>
+    <meta name="description" content="Book trusted local plumbers, electricians, gardeners, and house cleaners. Premium platform for secure booking, payment, and communication." />
+    <meta name="author" content="Masterful" />
+
+    <meta property="og:title" content="Masterful - Expert Trades on Your Doorstep" />
+    <meta property="og:description" content="Connect with verified local professionals for all your home service needs. Book, chat, and pay securely in one place." />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="https://lovable.dev/opengraph-image-p98pqg.png" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@lovable_dev" />
+    <meta name="twitter:image" content="https://lovable.dev/opengraph-image-p98pqg.png" />
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

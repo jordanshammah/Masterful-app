@@ -1,0 +1,271 @@
+/**
+ * Initiate Paystack Transaction Edge Function (Robust, Standalone Style)
+ * - Self-contained robust handling with clear errors and logs
+ * - CORS: proper OPTIONS handling and Access-Control headers
+ * - JWT auth via Supabase, ownership and status checks
+ * - Server-side validation and MPESA normalization
+ * - Paystack initialize via Paystack secret
+ * - Clear, actionable error messages for developers
+ */
+
+// Imports
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+// Supported currencies
+const SUPPORTED_CURRENCIES = ["NGN", "GHS", "ZAR", "USD", "KES"] as const;
+type Currency = typeof SUPPORTED_CURRENCIES[number];
+const DEFAULT_CURRENCY: Currency = ((Deno.env.get("VITE_PAYSTACK_CURRENCY") as Currency) || "KES") as Currency;
+
+// Paystack and Paystack Init URL
+const PAYSTACK_SECRET = (Deno.env.get("PAYSTACK_SECRET_KEY") || Deno.env.get("PAYSTACK_SECRET") || "");
+const PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize";
+
+// Supabase config
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") || "";
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") || "";
+
+// Helpers
+function generateRequestId(): string {
+  return `req_${Date.now().toString(36)}_${crypto.randomUUID?.().substring(0, 8) ?? Math.random().toString(36).slice(2, 10)}`;
+}
+
+function toMinorUnits(amountMajor: number): number {
+  return Math.round(amountMajor * 100);
+}
+
+function generateReference(prefix = 'MF'): string {
+  const t = Date.now().toString(36);
+  const r = crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2, 10);
+  return `${prefix}_${t}_${r}`.toUpperCase();
+}
+
+// CORS
+function getCorsHeaders(origin: string | null): Record<string, string> {
+  const DEFAULT_ORIGINS = [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'http://localhost:8080',
+  ];
+  const ALLOWED = (Deno.env.get('ALLOWED_ORIGINS') || '').split(',').filter(Boolean);
+  const origins = ALLOWED.length > 0 ? ALLOWED : DEFAULT_ORIGINS;
+  const isLocalOrigin = origin != null && (
+    origin.includes('localhost') || origin.includes('127.0.0.1') || origin.includes('::1')
+  );
+  const isOriginAllowed = origin != null && (origins.includes(origin) || isLocalOrigin);
+  const allowedOrigin = isOriginAllowed ? origin! : (origins[0] || '');
+  return {
+    "Access-Control-Allow-Origin": allowedOrigin,
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-paystack-signature",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Credentials": "true",
+  };
+}
+
+// Standard responses
+function errorResponse(message: string, status: number, corsHeaders: Record<string, string>, requestId?: string): Response {
+  return new Response(JSON.stringify({ ok: false, error: message, request_id: requestId }), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+function successResponse(data: any, corsHeaders: Record<string, string>, requestId?: string): Response {
+  return new Response(JSON.stringify({ ok: true, ...data, request_id: requestId }), {
+    status: 200,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+// Helpers
+function isUuid(v: string): boolean {
+  const r = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return r.test(v);
+}
+function validateJobId(jobId: any): { ok: boolean; reason?: string } {
+  if (typeof jobId !== 'string' || !jobId.trim()) return { ok: false, reason: 'Job ID is required' };
+  if (!isUuid(jobId.trim())) return { ok: false, reason: 'Job ID must be a UUID' };
+  return { ok: true };
+}
+function validatePaymentAmount(amount: any): { ok: boolean; reason?: string } {
+  if (typeof amount !== 'number' || isNaN(amount)) return { ok: false, reason: 'Amount must be a number' };
+  if (amount <= 0) return { ok: false, reason: 'Amount must be greater than 0' };
+  if (amount > 10000000) return { ok: false, reason: 'Amount too large' };
+  return { ok: true };
+}
+function validateCurrencyName(curr?: string): string | null {
+  const c = (curr || DEFAULT_CURRENCY).toString().toUpperCase();
+  if ((SUPPORTED_CURRENCIES as readonly string[]).includes(c)) return c;
+  return null;
+}
+function normalizePhoneForMpesa(phone: string): string | undefined {
+  const p = phone.replace(/[^0-9]/g, '');
+  if (p.startsWith('254') && p.length >= 12) return p;
+  if (p.startsWith('0') && p.length === 10) return '254' + p.slice(1);
+  // Accept 254XXXXXXXXXX or similar formats
+  return p.length >= 10 ? p : undefined;
+}
+
+// Entry point
+serve(async (req: Request) => {
+  const origin = req.headers.get('Origin');
+  const corsHeaders = getCorsHeaders(origin);
+
+  // CORS preflight
+  if (req.method === 'OPTIONS') {
+    console.log('[initiate-paystack] CORS preflight OPTIONS received from origin', origin);
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  if (req.method !== 'POST') {
+    return errorResponse('Method not allowed', 405, corsHeaders, undefined);
+  }
+
+  // Parse body
+  let payload: any;
+  try {
+    payload = await req.json();
+  } catch {
+    return errorResponse('Invalid JSON body', 400, corsHeaders, undefined);
+  }
+
+  const requestId = generateRequestId();
+
+  // Validate required fields
+  const { job_id, amount, channel, phone, currency = 'KES' } = payload ?? {};
+  const jobValidity = validateJobId(job_id);
+  if (!jobValidity.ok) return errorResponse('Invalid or missing job_id', 400, corsHeaders, requestId);
+  const amountValidity = validatePaymentAmount(amount);
+  if (!amountValidity.ok) return errorResponse('Invalid amount: ' + (amountValidity.reason ?? ''), 400, corsHeaders, requestId);
+  const currencyName = validateCurrencyName(currency) ?? 'KES';
+
+  // Phone validation for MPESA
+  let normalizedPhone: string | undefined;
+  if (phone) {
+    const n = normalizePhoneForMpesa(phone);
+    if (!n) return errorResponse('Invalid phone number format. Use 07XXXXXXXX or 254XXXXXXXXX', 400, corsHeaders, requestId);
+    normalizedPhone = n;
+  }
+
+  // Secrets
+  if (!PAYSTACK_SECRET) {
+    return errorResponse('Payment service not configured (missing Paystack secret)', 500, corsHeaders, requestId);
+  }
+
+  // Supabase auth & ownership
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    return errorResponse('Authentication not configured', 500, corsHeaders, requestId);
+  }
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return errorResponse('Missing or invalid authorization header', 401, corsHeaders, requestId);
+  }
+
+  const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    global: { headers: { Authorization: authHeader } },
+  });
+
+  const { data: userData, error: userError } = await supabase.auth.getUser();
+  const userId = userData?.user?.id;
+  if (userError || !userId) {
+    return errorResponse('Authentication failed', 401, corsHeaders, requestId);
+  }
+
+  // Load job and verify ownership/status
+  const { data: job, error: jobError } = await supabase
+    .from('jobs')
+    .select('id, customer_id, provider_id, status, quote_total, quote_accepted, payment_status')
+    .eq('id', job_id)
+    .single();
+  if (jobError || !job) {
+    return errorResponse('Job not found', 404, corsHeaders, requestId);
+  }
+  if (job.customer_id !== userId) {
+    return errorResponse("You don't have permission to pay for this job", 403, corsHeaders, requestId);
+  }
+  const allowedStatuses = ['completed','in_progress','awaiting_payment'];
+  if (!allowedStatuses.includes(job.status)) {
+    return errorResponse(`Cannot process payment for job with status: ${job.status}`, 400, corsHeaders, requestId);
+  }
+  if (job.payment_status === 'completed') {
+    return errorResponse('This job has already been paid for', 400, corsHeaders, requestId);
+  }
+  if (!job.quote_accepted) {
+    return errorResponse('Quote must be accepted before payment', 400, corsHeaders, requestId);
+  }
+
+  // Server-side amount check
+  const serverAmount = job.quote_total || 0;
+  const minAllowed = Math.max(serverAmount * 0.5, 100);
+  const maxAllowed = serverAmount * 1.5;
+  if (amount < minAllowed || amount > maxAllowed) {
+    return errorResponse(`Payment amount must be between ${minAllowed} and ${maxAllowed}`, 400, corsHeaders, requestId);
+  }
+
+  // Build Paystack payload
+  const amountMinor = toMinorUnits(amount);
+  const reference = generateReference('MF');
+  const metadata: any = {
+    job_id,
+    customer_id: userId,
+    provider_id: job.provider_id,
+    payment_type: 'job_payment',
+    quote_total: serverAmount,
+    request_id: requestId,
+  };
+
+  const paystackPayload: any = {
+    email: userData?.user?.email ?? '',
+    amount: amountMinor,
+    currency: currencyName,
+    reference,
+    metadata,
+  };
+
+  if (normalizedPhone) {
+    paystackPayload.mobile_money = {
+      phone: normalizedPhone,
+      provider: 'mpesa',
+    };
+    paystackPayload.channels = ['mobile_money'];
+  } else {
+    paystackPayload.customer = { id: userId };
+  }
+
+  // Initialize Paystack
+  let paystackRes;
+  try {
+    const res = await fetch(PAYSTACK_INIT_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${PAYSTACK_SECRET}`,
+      },
+      body: JSON.stringify(paystackPayload),
+    });
+    const text = await res.text();
+    try {
+      paystackRes = { ok: res.ok, status: res.status, body: JSON.parse(text) };
+    } catch {
+      paystackRes = { ok: res.ok, status: res.status, body: text };
+    }
+  } catch (err) {
+    return errorResponse('Failed to contact payment service', 502, corsHeaders, requestId);
+  }
+
+  if (!paystackRes.ok) {
+    const data = paystackRes.body?.data ?? paystackRes.body ?? {};
+    const message = data?.message || data?.gateway_response || 'Failed to initialize payment';
+    const statusCode = (paystackRes.status >= 400 && paystackRes.status < 500) ? 400 : 502;
+    return errorResponse(message, statusCode, corsHeaders, requestId);
+  }
+
+  const data = paystackRes.body?.data ?? paystackRes.body ?? {};
+  const responseOut: any = {
+    reference: data?.reference,
+    authorization_url: data?.authorization_url,
+    access_code: data?.access_code,
+    status: data?.status
+  };
+
+  return successResponse(responseOut, corsHeaders, requestId);
+});

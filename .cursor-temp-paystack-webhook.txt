@@ -1,0 +1,220 @@
+      .eq("provider_id", updatedJob.provider_id)
+      .eq("is_default", true)
+      .maybeSingle();
+
+    const subaccountId = payment?.paystack_subaccount_id || payoutMethod?.paystack_subaccount_id;
+
+    // Create payout record
+    const { data: payout, error: payoutError } = await supabaseAdmin
+      .from("payouts")
+      .insert({
+        provider_id: updatedJob.provider_id,
+        job_id: jobId,
+        payment_id: payment?.id,
+        payout_method_id: payoutMethod?.id,
+        amount: amountPaid,
+        currency: data.currency || 'KES',
+        platform_fee: platformFee,
+        net_amount: netAmount,
+        status: subaccountId ? 'completed' : 'pending', // If routed to subaccount, mark as completed
+        paystack_subaccount_id: subaccountId,
+        initiated_at: new Date().toISOString(),
+        completed_at: subaccountId ? new Date().toISOString() : null,
+        metadata: {
+          job_id: jobId,
+          payment_reference: data.reference,
+          paystack_fees: data.fees,
+          routing_method: subaccountId ? 'subaccount' : 'manual',
+        },
+      })
+      .select()
+      .single();
+
+    if (payoutError) {
+      console.error(`[${requestId}] Failed to create payout:`, payoutError);
+    } else {
+      console.log(`[${requestId}] ✅ Payout created: ${payout.id} (status: ${payout.status})`);
+      
+      if (subaccountId) {
+        console.log(`[${requestId}] Funds routed to subaccount: ${subaccountId}`);
+      } else {
+        console.log(`[${requestId}] Manual payout required - no subaccount routing`);
+      }
+    }
+  } catch (error) {
+    console.error(`[${requestId}] Error creating payout:`, error);
+  }
+
+  // TODO: Send notification to customer and provider
+}
+
+async function handleChargeFailed(
+  data: PaystackWebhookEvent['data'],
+  supabaseAdmin: ReturnType<typeof createClient>,
+  requestId: string
+): Promise<void> {
+  const jobId = data.metadata?.job_id;
+  
+  if (!jobId) {
+    console.log(`[${requestId}] No job_id in metadata, skipping job update`);
+    return;
+  }
+
+  console.log(`[${requestId}] Processing failed charge for job:`, {
+    jobId,
+    reference: data.reference,
+    message: data.message,
+    gateway_response: data.gateway_response,
+  });
+
+  // ========================================================================
+  // UPDATE PAYMENT RECORD (do not override completed)
+  // ========================================================================
+  
+  const { error: paymentUpdateError } = await supabaseAdmin
+    .from("payments")
+    .update({
+      status: "failed",
+      processed_at: new Date().toISOString(),
+    })
+    .eq("paystack_reference", data.reference)
+    .neq("status", "completed");
+
+  if (paymentUpdateError) {
+    console.warn(`[${requestId}] Failed to update payment record:`, paymentUpdateError);
+  }
+
+  // ========================================================================
+  // STEP 1: Verify job exists in database
+  // ========================================================================
+  const { data: existingJob, error: fetchError } = await supabaseAdmin
+    .from("jobs")
+    .select("id, payment_status")
+    .eq("id", jobId)
+    .single();
+
+  if (fetchError || !existingJob) {
+    console.error(`[${requestId}] Job ${jobId} not found in database:`, fetchError?.message);
+    return;
+  }
+
+  // ========================================================================
+  // STEP 2: Only update if payment is still pending (allow retry)
+  // ========================================================================
+  if (existingJob.payment_status === 'completed') {
+    console.log(`[${requestId}] Job ${jobId} already completed, not updating failure info`);
+    return;
+  }
+
+  // Update job with failure info (but don't change status - allow retry)
+  const { error: updateError } = await supabaseAdmin
+    .from("jobs")
+    .update({
+      payment_last_error: data.gateway_response || data.message || "Payment failed",
+      payment_last_attempt_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", jobId)
+    .neq("payment_status", "completed"); // Only update if not already completed
+
+  if (updateError) {
+    console.warn(`[${requestId}] Failed to update job ${jobId}:`, {
+      error: updateError.message,
+      code: updateError.code,
+    });
+  } else {
+    console.log(`[${requestId}] Job ${jobId} failure info updated`);
+  }
+}
+
+async function handleTransferSuccess(
+  data: PaystackWebhookEvent['data'],
+  supabaseAdmin: ReturnType<typeof createClient>,
+  requestId: string
+): Promise<void> {
+  // Handle provider payout completion
+  console.log(`[${requestId}] Transfer success:`, {
+    reference: data.reference,
+    amount: data.amount / 100,
+  });
+
+  try {
+    const { data: payout, error: payoutError } = await supabaseAdmin
+      .from("payouts")
+      .update({
+        status: "completed",
+        completed_at: new Date().toISOString(),
+      })
+      .eq("paystack_transfer_id", data.reference)
+      .neq("status", "completed")
+      .select("id, provider_id")
+      .maybeSingle();
+
+    if (payoutError) {
+      console.warn(`[${requestId}] Failed to update payout for transfer:`, payoutError);
+      return;
+    }
+
+    if (payout) {
+      console.log(`[${requestId}] ✅ Payout marked completed: ${payout.id}`);
+      // TODO: Notify provider of successful payout
+    } else {
+      console.log(`[${requestId}] No matching payout found for transfer: ${data.reference}`);
+    }
+  } catch (error) {
+    console.error(`[${requestId}] Error updating payout for transfer:`, error);
+  }
+}
+
+// ============================================================================
+// Main Handler
+// ============================================================================
+
+serve(async (req) => {
+  const requestId = generateRequestId();
+  const origin = req.headers.get('Origin');
+  const corsHeaders = getCorsHeaders(origin);
+  
+  // Log webhook attempt (always log, even if it fails)
+  console.log(`[${requestId}] ===== WEBHOOK RECEIVED =====`);
+  console.log(`[${requestId}] Method: ${req.method}`);
+  console.log(`[${requestId}] URL: ${req.url}`);
+  console.log(`[${requestId}] Timestamp: ${new Date().toISOString()}`);
+  console.log(`[${requestId}] Headers:`, {
+    'x-paystack-signature': req.headers.get('x-paystack-signature') ? 'PRESENT' : 'MISSING',
+    'content-type': req.headers.get('content-type'),
+    'user-agent': req.headers.get('user-agent'),
+    'x-forwarded-for': req.headers.get('x-forwarded-for'),
+  });
+  
+  // Handle CORS preflight (shouldn't happen for webhooks, but just in case)
+  if (req.method === "OPTIONS") {
+    console.log(`[${requestId}] Handling OPTIONS preflight`);
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  // Only allow POST
+  if (req.method !== "POST") {
+    console.warn(`[${requestId}] Invalid method: ${req.method}`);
+    return new Response("Method not allowed", { status: 405 });
+  }
+
+  try {
+    // ========================================================================
+    // 1. Validate Environment Variables
+    // ========================================================================
+    
+    let paystackSecretKey: string;
+    let supabaseUrl: string;
+    let supabaseServiceKey: string;
+    
+    try {
+      paystackSecretKey = getPaystackSecret();
+      if (!paystackSecretKey) {
+        throw new Error("Missing required environment variable: PAYSTACK_SECRET_KEY");
+      }
+      supabaseUrl = requireEnv("SUPABASE_URL");
+      supabaseServiceKey = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
+    } catch (envError) {
+      console.error(`[${requestId}] Environment error:`, envError);
+      return new Response("Server configuration error", { status: 500 });

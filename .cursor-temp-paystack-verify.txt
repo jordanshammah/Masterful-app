@@ -1,0 +1,180 @@
+      return errorResponse("Invalid or missing payment reference", 400, corsHeaders, requestId);
+    }
+
+    console.log(`[${requestId}] Verifying reference:`, reference);
+
+    // ========================================================================
+    // 5. Call Paystack Verify API
+    // ========================================================================
+    
+    const paystackResponse = await fetch(
+      `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
+      {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${paystackSecretKey}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (!paystackResponse.ok) {
+      const errorText = await paystackResponse.text();
+      console.error(`[${requestId}] Paystack verify error:`, paystackResponse.status, errorText);
+      
+      if (paystackResponse.status === 404) {
+        return errorResponse("Payment reference not found", 404, corsHeaders, requestId);
+      }
+      
+      return errorResponse("Failed to verify payment", 502, corsHeaders, requestId);
+    }
+
+    const paystackData: PaystackVerifyResponse = await paystackResponse.json();
+
+    if (!paystackData.status) {
+      console.error(`[${requestId}] Paystack verify returned false status:`, paystackData);
+      return errorResponse(paystackData.message || "Payment verification failed", 400, corsHeaders, requestId);
+    }
+
+    console.log(`[${requestId}] Paystack verification result:`, {
+      status: paystackData.data.status,
+      reference: paystackData.data.reference,
+      amount: paystackData.data.amount,
+    });
+
+    // ========================================================================
+    // 6. Verify Job Ownership and Update Status (Enhanced with Payout Reconciliation)
+    // ========================================================================
+    
+    const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
+    const jobId = paystackData.data.metadata?.job_id;
+    
+    let jobUpdated = false;
+    let payoutCreated = false;
+
+    // Always reconcile payment record if Paystack shows success
+    if (paystackData.data.status === 'success') {
+      const { data: payment, error: paymentUpdateError } = await supabaseAdmin
+        .from("payments")
+        .update({
+          status: "completed",
+          processed_at: paystackData.data.paid_at || new Date().toISOString(),
+        })
+        .eq("paystack_reference", reference)
+        .eq("status", "pending")
+        .select("id, job_id, provider_id, paystack_subaccount_id")
+        .maybeSingle();
+
+      if (paymentUpdateError) {
+        console.warn(`[${requestId}] Failed to update payment:`, paymentUpdateError);
+      } else if (payment) {
+        console.log(`[${requestId}] Payment record updated: ${payment.id}`);
+      }
+    }
+
+    if (jobId) {
+      // Fetch job to verify ownership
+      const { data: job, error: jobError } = await supabaseAdmin
+        .from("jobs")
+        .select("id, customer_id, provider_id, payment_status, quote_total, platform_fee_percent")
+        .eq("id", jobId)
+        .single();
+
+      if (jobError) {
+        console.error(`[${requestId}] Job lookup error:`, jobError);
+        // Don't fail the verify - return the Paystack result anyway
+      } else if (job) {
+        // Verify user owns this job
+        if (job.customer_id !== user.id) {
+          console.warn(`[${requestId}] User ${user.id} verified payment for job they don't own: ${jobId}`);
+          // Still return the verification result, but don't update the job
+        } else if (paystackData.data.status === 'success' && job.payment_status !== 'completed') {
+          // Update job payment status
+          const amountPaid = paystackData.data.amount / 100; // Convert from minor units
+          const paymentMethod = paystackData.data.channel === 'mobile_money' ? 'mpesa' : 'card';
+          
+          const { error: updateError } = await supabaseAdmin
+            .from("jobs")
+            .update({
+              payment_status: "completed",
+              payment_completed_at: paystackData.data.paid_at || new Date().toISOString(),
+              payment_amount: amountPaid,
+              payment_method: paymentMethod,
+              payment_reference: reference,
+              status: "completed", // Also mark job as completed
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", jobId);
+
+          if (updateError) {
+            console.error(`[${requestId}] Failed to update job:`, updateError);
+          } else {
+            console.log(`[${requestId}] Job ${jobId} payment status updated to completed`);
+            jobUpdated = true;
+          }
+
+          // ====================================================================
+          // CREATE PAYOUT FOR PROVIDER (if not exists)
+          // ====================================================================
+          
+          const { data: existingPayout } = await supabaseAdmin
+            .from("payouts")
+            .select("id")
+            .eq("job_id", jobId)
+            .maybeSingle();
+
+          if (!existingPayout) {
+            const platformFeePercent = job.platform_fee_percent || 15;
+            const platformFee = amountPaid * (platformFeePercent / 100);
+            const netAmount = amountPaid - platformFee;
+
+            // Get provider's default payout method
+            const { data: payoutMethod } = await supabaseAdmin
+              .from("provider_payout_methods")
+              .select("id, paystack_subaccount_id")
+              .eq("provider_id", job.provider_id)
+              .eq("is_default", true)
+              .maybeSingle();
+
+            const subaccountId = payment?.paystack_subaccount_id || payoutMethod?.paystack_subaccount_id;
+
+            const { data: newPayout, error: payoutError } = await supabaseAdmin
+              .from("payouts")
+              .insert({
+                provider_id: job.provider_id,
+                job_id: jobId,
+                payment_id: payment?.id,
+                payout_method_id: payoutMethod?.id,
+                amount: amountPaid,
+                currency: paystackData.data.currency,
+                platform_fee: platformFee,
+                net_amount: netAmount,
+                status: subaccountId ? 'completed' : 'pending',
+                paystack_subaccount_id: subaccountId,
+                initiated_at: new Date().toISOString(),
+                completed_at: subaccountId ? new Date().toISOString() : null,
+                metadata: {
+                  job_id: jobId,
+                  payment_reference: reference,
+                  verified_by: 'verify-endpoint',
+                  verification_timestamp: new Date().toISOString(),
+                },
+              })
+              .select()
+              .maybeSingle();
+
+            if (payoutError) {
+              console.error(`[${requestId}] Failed to create payout:`, payoutError);
+            } else if (newPayout) {
+              console.log(`[${requestId}] ✅ Payout created via verify: ${newPayout.id}`);
+              payoutCreated = true;
+            }
+          } else {
+            console.log(`[${requestId}] Payout already exists for job ${jobId}`);
+          }
+        } else if (job.payment_status === 'completed') {
+          console.log(`[${requestId}] Job ${jobId} already marked as completed`);
+        }
+      }
+    }
+
