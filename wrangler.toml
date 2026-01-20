@@ -1,0 +1,17 @@
+name = "masterful-app"
+compatibility_date = "2024-04-01"
+
+# Required for Vite/React apps that may use Node.js APIs
+node_compat = true
+
+# Pages configuration
+pages_build_output_dir = "dist"
+
+# Environment variables (set these in Cloudflare Pages dashboard)
+# These are examples - set actual values in Cloudflare Pages → Settings → Environment Variables
+# [vars]
+# VITE_SUPABASE_URL = "your-supabase-url"
+# VITE_SUPABASE_PUBLISHABLE_KEY = "your-supabase-anon-key"
+
+# Note: Supabase Edge Functions are deployed separately via Supabase CLI
+# This wrangler.toml is only for the frontend deployment to Cloudflare Pages
